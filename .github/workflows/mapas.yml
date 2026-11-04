@@ -54,8 +54,9 @@ jobs:
           for u in ${SEL//,/ }; do grep -qx "$u" <<<"${TODAS//,/$'\n'}" || { echo "::error::UF inválida: $u"; exit 1; }; done
           # tag: AAAA.MM; se já existir release publicada com esse nome, usa AAAA.MM-r<run_number>.
           # Rascunho criado por ESTA mesma execução (re-run) é reaproveitado.
-          T=$V
-          for cand in "$V" "$V-r$GITHUB_RUN_NUMBER"; do
+          # rascunho vazio (de rodada anterior que falhou cedo) do mesmo mês é reaproveitado
+          T=$(gh api "repos/$GH_REPO/releases?per_page=50" --jq "[.[]|select(.draft and (.tag_name|startswith(\"$V\")) and (.assets|length==0))][0].tag_name // empty")
+          [ -n "$T" ] || for cand in "$V" "$V-r$GITHUB_RUN_NUMBER"; do
             T=$cand
             if info=$(gh release view "$cand" --json isDraft,body 2>/dev/null); then
               if [ "$(jq -r .isDraft <<<"$info")" = true ] && jq -r .body <<<"$info" | grep -q "run-id: $GITHUB_RUN_ID"; then break; fi
@@ -83,7 +84,7 @@ jobs:
 
       - name: Ferramentas (osmium, shapely, pyosmium)
         run: |
-          sudo apt-get update -q && sudo apt-get install -y -q osmium-tool
+          sudo apt-get update -q && sudo apt-get install -y -q osmium-tool time
           pip install --quiet "shapely>=2" osmium numpy
           osmium --version | head -1; df -h . | tail -1; free -g | head -2
 
@@ -98,7 +99,7 @@ jobs:
       - name: Polígonos das UFs
         run: python3 tools/build_mapas.py --pbf brazil.osm.pbf --trabalho "$PWD/trabalho" --etapa poly
 
-      - name: Recorte por UF (osmium extract, 3 lotes de 9)
+      - name: Recorte por UF (osmium extract, lotes de 2 para caber na RAM)
         env:
           UFS: ${{ steps.v.outputs.ufs }}
         run: |
@@ -108,11 +109,15 @@ jobs:
           cfg = json.load(open("trabalho/recortes.json"))
           sel = set(json.loads(os.environ["UFS"]))
           ex = [e for e in cfg["extracts"] if e["output"].split(".")[0] in sel]
-          for i in range(0, len(ex), 9):
-              json.dump({**cfg, "extracts": ex[i:i + 9]}, open(f"trabalho/lote_{i // 9}.json", "w"))
+          # cada recorte "smart" do Brasil inteiro usa alguns GB de RAM (conjuntos de ids); 9 por vez estourou o runner
+          for i in range(0, len(ex), 2):
+              json.dump({**cfg, "extracts": ex[i:i + 2]}, open(f"trabalho/lote_{i // 2:02d}.json", "w"))
           EOF
           mkdir -p trabalho/pbf
-          for f in trabalho/lote_*.json; do osmium extract --overwrite -s smart -c "$f" brazil.osm.pbf; done
+          for f in trabalho/lote_*.json; do
+            echo "== $f $(jq -c '[.extracts[].output]' "$f")"
+            /usr/bin/time -f "   %e s, pico %M KB" osmium extract --overwrite -s smart -c "$f" brazil.osm.pbf
+          done
           ls -l trabalho/pbf; df -h . | tail -1
 
       - name: Divisas (gateways entre UFs)
